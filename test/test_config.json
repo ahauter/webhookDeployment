@@ -5,5 +5,6 @@
   "self_update_repo_url": "file:///home/austin/Repositories/Personal/binaryDeploy/test/test_repos/test_binarydeploy_updater",
   "deploy_dir": "./test_deployments",
   "self_update_dir": "./test_self_update",
-  "allowed_branches": ["main", "test-branch"]
+  "allowed_branches": ["main", "test-branch"],
+  "log_file": "./test_binaryDeploy.log"
 }

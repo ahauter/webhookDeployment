@@ -55,7 +55,8 @@ Create `config.json`:
   "self_update_repo_url": "https://github.com/your-username/binaryDeploy-updater.git",
   "deploy_dir": "./deployments",
   "self_update_dir": "./self-update",
-  "allowed_branches": ["main", "master"]
+  "allowed_branches": ["main", "master"],
+  "log_file": "./binaryDeploy.log"
 }
 ```
 
@@ -110,6 +111,7 @@ backup_binary=/opt/binaryDeploy/binaryDeploy.backup
 | `deploy_dir` | string | Directory for target application deployments |
 | `self_update_dir` | string | Directory for self-update operations |
 | `allowed_branches` | array | Branches that trigger deployments |
+| `log_file` | string | Path to structured JSON log file (default: "./binaryDeploy.log") |
 
 ### deploy.config (Application Repository)
 

@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -32,7 +32,7 @@ func NewSelfUpdater(currentBinaryPath, selfUpdateDir string) *SelfUpdater {
 
 // Update performs the self-update process with automatic rollback on failure
 func (su *SelfUpdater) Update(repoURL, branch string) error {
-	log.Printf("Starting self-update from %s (branch: %s)", repoURL, branch)
+	slog.Info("Starting self-update", "repo_url", repoURL, "branch", branch)
 
 	// Create temporary directory for update
 	if err := os.MkdirAll(su.TempDir, 0755); err != nil {
@@ -78,9 +78,9 @@ func (su *SelfUpdater) Update(repoURL, branch string) error {
 	if err := su.replaceBinaryAtomically(newBinaryPath); err != nil {
 		// Try to rollback on failure
 		if rollbackErr := su.Rollback(); rollbackErr != nil {
-			log.Printf("Critical: Failed to rollback after binary replacement failure: %v", rollbackErr)
+			slog.Error("Failed to rollback after binary replacement failure", "error", rollbackErr)
 		} else {
-			log.Printf("Successfully rolled back after binary replacement failure")
+			slog.Info("Successfully rolled back after binary replacement failure")
 		}
 		su.cleanup()
 		return fmt.Errorf("replacing binary (rollback attempted): %w", err)
@@ -88,11 +88,11 @@ func (su *SelfUpdater) Update(repoURL, branch string) error {
 
 	// Test the new binary by running it with --help
 	if err := su.testNewBinary(); err != nil {
-		log.Printf("New binary test failed: %v", err)
+		slog.Error("New binary test failed", "error", err)
 		if rollbackErr := su.Rollback(); rollbackErr != nil {
-			log.Printf("Critical: Failed to rollback after binary test failure: %v", rollbackErr)
+			slog.Error("Failed to rollback after binary test failure", "error", rollbackErr)
 		} else {
-			log.Printf("Successfully rolled back after binary test failure")
+			slog.Info("Successfully rolled back after binary test failure")
 		}
 		su.cleanup()
 		return fmt.Errorf("new binary test failed (rollback attempted): %w", err)
@@ -101,7 +101,7 @@ func (su *SelfUpdater) Update(repoURL, branch string) error {
 	// Clean up temporary files on success
 	su.cleanup()
 
-	log.Printf("Self-update completed successfully")
+	slog.Info("Self-update completed successfully")
 	return nil
 }
 
@@ -119,19 +119,19 @@ func (su *SelfUpdater) testNewBinary() error {
 		}
 	}
 
-	log.Printf("New binary test passed")
+	slog.Info("New binary test passed")
 	return nil
 }
 
 // cloneOrUpdateRepo clones the repository or updates an existing one
 func (su *SelfUpdater) cloneOrUpdateRepo(repoURL, repoDir string) error {
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
-		log.Printf("Cloning repository to %s", repoDir)
+		slog.Info("Cloning repository", "path", repoDir)
 		if err := su.runCommand("git", "clone", repoURL, repoDir); err != nil {
 			return err
 		}
 	} else {
-		log.Printf("Updating repository in %s", repoDir)
+		slog.Info("Updating repository", "path", repoDir)
 		if err := su.runCommandInDir(repoDir, "git", "fetch", "origin"); err != nil {
 			return err
 		}
@@ -188,7 +188,7 @@ func (su *SelfUpdater) backupCurrentBinary(deployConfig interface{}) error {
 		backupPath = backupBinary
 	}
 
-	log.Printf("Backing up current binary to %s", backupPath)
+	slog.Info("Backing up current binary", "backup_path", backupPath)
 
 	// Remove existing backup
 	if _, err := os.Stat(backupPath); err == nil {
@@ -217,7 +217,7 @@ func (su *SelfUpdater) buildNewBinary(repoDir string, deployConfig interface{}) 
 		return "", fmt.Errorf("build_command not found in deploy.config")
 	}
 
-	log.Printf("Building new binary with command: %s", buildCommand)
+	slog.Info("Building new binary", "command", buildCommand)
 
 	// Parse command and arguments
 	parts := strings.Fields(buildCommand)
@@ -270,7 +270,7 @@ func (su *SelfUpdater) verifyNewBinary(binaryPath string) error {
 		// Try with --help if --version fails
 		cmd = exec.CommandContext(ctx, binaryPath, "--help")
 		if err := cmd.Run(); err != nil {
-			log.Printf("Warning: Could not verify binary with --version or --help: %v", err)
+			slog.Warn("Could not verify binary with --version or --help", "error", err)
 		}
 	}
 
@@ -279,7 +279,7 @@ func (su *SelfUpdater) verifyNewBinary(binaryPath string) error {
 
 // replaceBinaryAtomically replaces the current binary with the new one
 func (su *SelfUpdater) replaceBinaryAtomically(newBinaryPath string) error {
-	log.Printf("Replacing binary atomically")
+	slog.Info("Replacing binary atomically")
 
 	// Create temporary file path for atomic replacement
 	tempPath := su.CurrentBinaryPath + ".new"
@@ -308,7 +308,7 @@ func (su *SelfUpdater) Rollback() error {
 		return fmt.Errorf("no backup binary found at %s", su.BackupPath)
 	}
 
-	log.Printf("Rolling back to backup binary: %s", su.BackupPath)
+	slog.Info("Rolling back to backup binary", "backup_path", su.BackupPath)
 
 	// Create temporary file for atomic rollback
 	tempPath := su.CurrentBinaryPath + ".rollback"
@@ -326,7 +326,7 @@ func (su *SelfUpdater) Rollback() error {
 		return fmt.Errorf("atomic rollback failed: %w", err)
 	}
 
-	log.Printf("Rollback completed successfully")
+	slog.Info("Rollback completed successfully")
 	return nil
 }
 
@@ -339,7 +339,7 @@ func (su *SelfUpdater) HasBackup() bool {
 // cleanup removes temporary files
 func (su *SelfUpdater) cleanup() {
 	if err := os.RemoveAll(su.TempDir); err != nil {
-		log.Printf("Warning: Failed to clean up temp directory: %v", err)
+		slog.Warn("Failed to clean up temp directory", "error", err)
 	}
 }
 

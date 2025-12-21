@@ -8,7 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
@@ -30,6 +30,7 @@ type Config struct {
 	DeployDir         string   `json:"deploy_dir"`
 	SelfUpdateDir     string   `json:"self_update_dir"`
 	AllowedBranches   []string `json:"allowed_branches"`
+	LogFile           string   `json:"log_file"`
 }
 
 type GitHubPushPayload struct {
@@ -48,6 +49,7 @@ var appConfig Config
 
 func main() {
 	loadConfig()
+	setupLogger()
 
 	server := &http.Server{
 		Addr:    ":" + appConfig.Port,
@@ -55,9 +57,10 @@ func main() {
 	}
 
 	go func() {
-		log.Printf("Starting webhook server on port %s", appConfig.Port)
+		slog.Info("Starting webhook server", "port", appConfig.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
-			log.Fatalf("Server failed: %v", err)
+			slog.Error("Server failed", "error", err)
+			os.Exit(1)
 		}
 	}()
 
@@ -65,30 +68,47 @@ func main() {
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
 
-	log.Println("Shutting down server...")
+	slog.Info("Shutting down server...")
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
 	if err := server.Shutdown(ctx); err != nil {
-		log.Printf("Server forced to shutdown: %v", err)
+		slog.Error("Server forced to shutdown", "error", err)
 	}
 
-	log.Println("Server exited")
+	slog.Info("Server exited")
+}
+
+func setupLogger() {
+	if appConfig.LogFile == "" {
+		appConfig.LogFile = "./binaryDeploy.log"
+	}
+
+	logFile, err := os.OpenFile(appConfig.LogFile, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
+	if err != nil {
+		panic(err)
+	}
+
+	logger := slog.New(slog.NewJSONHandler(logFile, nil))
+	slog.SetDefault(logger)
 }
 
 func loadConfig() {
 	configFile := "config.json"
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		log.Fatalf("Config file %s not found", configFile)
+		slog.Error("Config file not found", "file", configFile)
+		os.Exit(1)
 	}
 
 	data, err := os.ReadFile(configFile)
 	if err != nil {
-		log.Fatalf("Failed to read config file: %v", err)
+		slog.Error("Failed to read config file", "error", err)
+		os.Exit(1)
 	}
 
 	if err := json.Unmarshal(data, &appConfig); err != nil {
-		log.Fatalf("Failed to parse config file: %v", err)
+		slog.Error("Failed to parse config file", "error", err)
+		os.Exit(1)
 	}
 
 	if appConfig.Port == "" {
@@ -138,13 +158,13 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	branch := extractBranchFromRef(payload.Ref)
 	if !isAllowedBranch(branch) {
-		log.Printf("Branch %s is not in allowed branches", branch)
+		slog.Info("Branch not in allowed branches", "branch", branch)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Branch %s is not configured for auto-deployment", branch)
 		return
 	}
 
-	log.Printf("Received push event for branch %s, repository %s", branch, payload.Repository.Name)
+	slog.Info("Received push event", "branch", branch, "repository", payload.Repository.Name)
 
 	go func() {
 		var deployErr error
@@ -155,21 +175,20 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		} else if payload.Repository.URL == appConfig.TargetRepoURL {
 			deployErr = deployTargetRepo(payload.Repository.URL)
 		} else {
-			log.Printf("Unknown repository: %s", payload.Repository.URL)
+			slog.Info("Unknown repository", "url", payload.Repository.URL)
 			w.WriteHeader(http.StatusOK)
 			fmt.Fprintf(w, "Repository not configured for deployment")
 			return
 		}
 
 		if deployErr != nil {
-			log.Printf("Deployment failed: %v", deployErr)
+			slog.Error("Deployment failed", "error", deployErr)
 		} else {
-			log.Printf("Deployment completed successfully")
+			slog.Info("Deployment completed successfully")
 		}
 	}()
 
 	w.WriteHeader(http.StatusOK)
-	fmt.Fprintf(w, "Deployment started for branch %s", branch)
 }
 
 func verifySignature(body []byte, signature string) bool {
@@ -204,7 +223,7 @@ func isAllowedBranch(branch string) bool {
 }
 
 func deployTargetRepo(repoURL string) error {
-	log.Printf("Starting deployment process for %s", repoURL)
+	slog.Info("Starting deployment process", "repo_url", repoURL)
 
 	if err := os.MkdirAll(appConfig.DeployDir, 0755); err != nil {
 		return fmt.Errorf("failed to create deploy directory: %w", err)
@@ -213,12 +232,12 @@ func deployTargetRepo(repoURL string) error {
 	repoDir := filepath.Join(appConfig.DeployDir, "repo")
 
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
-		log.Printf("Cloning repository to %s", repoDir)
+		slog.Info("Cloning repository", "path", repoDir)
 		if err := runCommand("git", "clone", repoURL, repoDir); err != nil {
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
 	} else {
-		log.Printf("Updating repository in %s", repoDir)
+		slog.Info("Updating repository", "path", repoDir)
 		if err := runCommandInDir(repoDir, "git", "fetch", "origin"); err != nil {
 			return fmt.Errorf("failed to fetch updates: %w", err)
 		}
@@ -236,7 +255,7 @@ func deployTargetRepo(repoURL string) error {
 
 	// Run build command
 	if deployConfig.BuildCommand != "" {
-		log.Printf("Running build command: %s", deployConfig.BuildCommand)
+		slog.Info("Running build command", "command", deployConfig.BuildCommand)
 		parts := strings.Fields(deployConfig.BuildCommand)
 		if err := runCommandInDir(repoDir, parts[0], parts[1:]...); err != nil {
 			return fmt.Errorf("build failed: %w", err)
@@ -244,13 +263,13 @@ func deployTargetRepo(repoURL string) error {
 	}
 
 	// TODO: Start/stop process management (to be implemented)
-	log.Printf("Process management not yet implemented for: %s", deployConfig.RunCommand)
+	slog.Info("Process management not yet implemented", "run_command", deployConfig.RunCommand)
 
 	return nil
 }
 
 func deploySelfUpdate() error {
-	log.Printf("Starting self-update process")
+	slog.Info("Starting self-update process")
 
 	// Get current binary path
 	currentBinary, err := os.Executable()
