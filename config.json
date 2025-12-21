@@ -1,0 +1,9 @@
+{
+  "port": "8080",
+  "secret": "your-webhook-secret-here",
+  "repo_url": "https://github.com/your-username/your-repo.git",
+  "deploy_dir": "./deployments",
+  "build_command": "go build -o app .",
+  "restart_command": "systemctl restart your-app",
+  "allowed_branches": ["main", "master"]
+}

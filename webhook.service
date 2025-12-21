@@ -1,0 +1,24 @@
+[Unit]
+Description=Webhook Deployment Server
+After=network.target
+
+[Service]
+Type=exec
+User=nobody
+Group=nogroup
+WorkingDirectory=/opt/binaryDeploy
+ExecStart=/opt/binaryDeploy/binaryDeploy
+Restart=always
+RestartSec=5
+Environment=PORT=8080
+
+# Security settings
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/binaryDeploy/deployments
+ReadWritePaths=/var/log/webhook-deploy.log
+
+[Install]
+WantedBy=multi-user.target
