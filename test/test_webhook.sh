@@ -317,7 +317,7 @@ test_unknown_repository() {
     if [[ "$http_code" == "200" ]] && echo "$response_body" | grep -q "Repository not configured for deployment"; then
         test_result "Unknown Repository" "PASS" "Correctly handled unknown repository"
     else
-        test_result "Unknown Repository" "FAIL" "Expected 200 with ignore message, got $http_code: $response_body"
+        test_result "Unknown Repository" "FAIL" "Expected 200 with message, got $http_code: '$response_body'"
     fi
 }
 
