@@ -17,16 +17,19 @@ import (
 	"strings"
 	"syscall"
 	"time"
+
+	"binaryDeploy/config"
+	"binaryDeploy/updater"
 )
 
 type Config struct {
-	Port            string   `json:"port"`
-	Secret          string   `json:"secret"`
-	RepoURL         string   `json:"repo_url"`
-	DeployDir       string   `json:"deploy_dir"`
-	BuildCommand    string   `json:"build_command"`
-	RestartCommand  string   `json:"restart_command"`
-	AllowedBranches []string `json:"allowed_branches"`
+	Port              string   `json:"port"`
+	Secret            string   `json:"secret"`
+	TargetRepoURL     string   `json:"target_repo_url"`
+	SelfUpdateRepoURL string   `json:"self_update_repo_url"`
+	DeployDir         string   `json:"deploy_dir"`
+	SelfUpdateDir     string   `json:"self_update_dir"`
+	AllowedBranches   []string `json:"allowed_branches"`
 }
 
 type GitHubPushPayload struct {
@@ -41,18 +44,18 @@ type GitHubPushPayload struct {
 	} `json:"head_commit"`
 }
 
-var config Config
+var appConfig Config
 
 func main() {
 	loadConfig()
 
 	server := &http.Server{
-		Addr:    ":" + config.Port,
+		Addr:    ":" + appConfig.Port,
 		Handler: setupRoutes(),
 	}
 
 	go func() {
-		log.Printf("Starting webhook server on port %s", config.Port)
+		log.Printf("Starting webhook server on port %s", appConfig.Port)
 		if err := server.ListenAndServe(); err != nil && err != http.ErrServerClosed {
 			log.Fatalf("Server failed: %v", err)
 		}
@@ -84,12 +87,12 @@ func loadConfig() {
 		log.Fatalf("Failed to read config file: %v", err)
 	}
 
-	if err := json.Unmarshal(data, &config); err != nil {
+	if err := json.Unmarshal(data, &appConfig); err != nil {
 		log.Fatalf("Failed to parse config file: %v", err)
 	}
 
-	if config.Port == "" {
-		config.Port = "8080"
+	if appConfig.Port == "" {
+		appConfig.Port = "8080"
 	}
 }
 
@@ -144,8 +147,22 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	log.Printf("Received push event for branch %s, repository %s", branch, payload.Repository.Name)
 
 	go func() {
-		if err := deploy(); err != nil {
-			log.Printf("Deployment failed: %v", err)
+		var deployErr error
+
+		// Check if this is a self-update or target repo deployment
+		if payload.Repository.URL == appConfig.SelfUpdateRepoURL {
+			deployErr = deploySelfUpdate()
+		} else if payload.Repository.URL == appConfig.TargetRepoURL {
+			deployErr = deployTargetRepo(payload.Repository.URL)
+		} else {
+			log.Printf("Unknown repository: %s", payload.Repository.URL)
+			w.WriteHeader(http.StatusOK)
+			fmt.Fprintf(w, "Repository not configured for deployment")
+			return
+		}
+
+		if deployErr != nil {
+			log.Printf("Deployment failed: %v", deployErr)
 		} else {
 			log.Printf("Deployment completed successfully")
 		}
@@ -156,11 +173,11 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func verifySignature(body []byte, signature string) bool {
-	if config.Secret == "" {
+	if appConfig.Secret == "" {
 		return true
 	}
 
-	expectedSig := "sha256=" + computeHMAC(body, config.Secret)
+	expectedSig := "sha256=" + computeHMAC(body, appConfig.Secret)
 	return hmac.Equal([]byte(signature), []byte(expectedSig))
 }
 
@@ -175,10 +192,10 @@ func extractBranchFromRef(ref string) string {
 }
 
 func isAllowedBranch(branch string) bool {
-	if len(config.AllowedBranches) == 0 {
+	if len(appConfig.AllowedBranches) == 0 {
 		return true
 	}
-	for _, allowed := range config.AllowedBranches {
+	for _, allowed := range appConfig.AllowedBranches {
 		if branch == allowed {
 			return true
 		}
@@ -186,18 +203,18 @@ func isAllowedBranch(branch string) bool {
 	return false
 }
 
-func deploy() error {
-	log.Println("Starting deployment process...")
+func deployTargetRepo(repoURL string) error {
+	log.Printf("Starting deployment process for %s", repoURL)
 
-	if err := os.MkdirAll(config.DeployDir, 0755); err != nil {
+	if err := os.MkdirAll(appConfig.DeployDir, 0755); err != nil {
 		return fmt.Errorf("failed to create deploy directory: %w", err)
 	}
 
-	repoDir := filepath.Join(config.DeployDir, "repo")
+	repoDir := filepath.Join(appConfig.DeployDir, "repo")
 
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		log.Printf("Cloning repository to %s", repoDir)
-		if err := runCommand("git", "clone", config.RepoURL, repoDir); err != nil {
+		if err := runCommand("git", "clone", repoURL, repoDir); err != nil {
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
 	} else {
@@ -210,23 +227,42 @@ func deploy() error {
 		}
 	}
 
-	if config.BuildCommand != "" {
-		log.Printf("Running build command: %s", config.BuildCommand)
-		parts := strings.Fields(config.BuildCommand)
+	// Read deploy config from the cloned repository
+	configPath := filepath.Join(repoDir, "deploy.config")
+	deployConfig, err := config.LoadDeployConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("reading deploy config: %w", err)
+	}
+
+	// Run build command
+	if deployConfig.BuildCommand != "" {
+		log.Printf("Running build command: %s", deployConfig.BuildCommand)
+		parts := strings.Fields(deployConfig.BuildCommand)
 		if err := runCommandInDir(repoDir, parts[0], parts[1:]...); err != nil {
 			return fmt.Errorf("build failed: %w", err)
 		}
 	}
 
-	if config.RestartCommand != "" {
-		log.Printf("Running restart command: %s", config.RestartCommand)
-		parts := strings.Fields(config.RestartCommand)
-		if err := runCommand("", parts[0], parts[1:]...); err != nil {
-			return fmt.Errorf("restart failed: %w", err)
-		}
-	}
+	// TODO: Start/stop process management (to be implemented)
+	log.Printf("Process management not yet implemented for: %s", deployConfig.RunCommand)
 
 	return nil
+}
+
+func deploySelfUpdate() error {
+	log.Printf("Starting self-update process")
+
+	// Get current binary path
+	currentBinary, err := os.Executable()
+	if err != nil {
+		return fmt.Errorf("getting current binary path: %w", err)
+	}
+
+	// Create self-updater
+	updaterInstance := updater.NewSelfUpdater(currentBinary, appConfig.SelfUpdateDir)
+
+	// Perform self-update
+	return updaterInstance.Update(appConfig.SelfUpdateRepoURL, "main")
 }
 
 func runCommand(dir, command string, args ...string) error {

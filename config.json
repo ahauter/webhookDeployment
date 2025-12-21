@@ -1,9 +1,9 @@
 {
   "port": "8080",
   "secret": "your-webhook-secret-here",
-  "repo_url": "https://github.com/your-username/your-repo.git",
+  "target_repo_url": "https://github.com/your-username/your-repo.git",
+  "self_update_repo_url": "https://github.com/your-username/binaryDeploy-updater.git",
   "deploy_dir": "./deployments",
-  "build_command": "go build -o app .",
-  "restart_command": "systemctl restart your-app",
+  "self_update_dir": "./self-update",
   "allowed_branches": ["main", "master"]
 }
