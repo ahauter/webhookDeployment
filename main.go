@@ -19,8 +19,17 @@ import (
 	"time"
 
 	"binaryDeploy/config"
+	"binaryDeploy/processmanager"
 	"binaryDeploy/updater"
 )
+
+// Helper function to get minimum of two integers
+func min(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}
 
 type Config struct {
 	Port              string   `json:"port"`
@@ -45,11 +54,17 @@ type GitHubPushPayload struct {
 	} `json:"head_commit"`
 }
 
-var appConfig Config
+var (
+	appConfig      Config
+	processManager *processmanager.ProcessManager
+)
 
 func main() {
 	loadConfig()
 	setupLogger()
+
+	// Initialize process manager
+	processManager = processmanager.NewProcessManager()
 
 	server := &http.Server{
 		Addr:    ":" + appConfig.Port,
@@ -69,6 +84,12 @@ func main() {
 	<-quit
 
 	slog.Info("Shutting down server...")
+
+	// Shutdown process manager first
+	if err := processManager.Shutdown(); err != nil {
+		slog.Error("Failed to shutdown process manager", "error", err)
+	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
 
@@ -127,7 +148,17 @@ func setupRoutes() http.Handler {
 }
 
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
+	// Log incoming request details
+	slog.Info("Incoming webhook request",
+		"method", r.Method,
+		"path", r.URL.Path,
+		"remote_addr", r.RemoteAddr,
+		"user_agent", r.Header.Get("User-Agent"),
+		"content_type", r.Header.Get("Content-Type"),
+		"signature_present", r.Header.Get("X-Hub-Signature-256") != "")
+
 	if r.Method != http.MethodPost {
+		slog.Warn("Invalid HTTP method received", "method", r.Method)
 		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -140,21 +171,36 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	body, err := io.ReadAll(r.Body)
 	if err != nil {
+		slog.Error("Failed to read request body", "error", err)
 		http.Error(w, "Failed to read body", http.StatusInternalServerError)
 		return
 	}
 	defer r.Body.Close()
 
+	slog.Info("Request body read successfully", "body_size", len(body))
+
 	if !verifySignature(body, signature) {
+		slog.Warn("Invalid signature verification",
+			"received_signature", signature,
+			"body_size", len(body))
 		http.Error(w, "Invalid signature", http.StatusUnauthorized)
 		return
 	}
 
+	slog.Info("Signature verification successful")
+
 	var payload GitHubPushPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
+		slog.Error("Failed to unmarshal JSON payload", "error", err, "body_preview", string(body[:min(200, len(body))]))
 		http.Error(w, "Invalid payload", http.StatusBadRequest)
 		return
 	}
+
+	slog.Info("Payload parsed successfully",
+		"repository", payload.Repository.Name,
+		"ref", payload.Ref,
+		"branch", extractBranchFromRef(payload.Ref),
+		"commit_id", payload.HeadCommit.ID[:min(8, len(payload.HeadCommit.ID))])
 
 	branch := extractBranchFromRef(payload.Ref)
 	if !isAllowedBranch(branch) {
@@ -166,27 +212,29 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("Received push event", "branch", branch, "repository", payload.Repository.Name)
 
-	go func() {
-		var deployErr error
-
-		// Check if this is a self-update or target repo deployment
-		if payload.Repository.URL == appConfig.SelfUpdateRepoURL {
-			deployErr = deploySelfUpdate()
-		} else if payload.Repository.URL == appConfig.TargetRepoURL {
-			deployErr = deployTargetRepo(payload.Repository.URL)
-		} else {
-			slog.Info("Unknown repository", "url", payload.Repository.URL)
-			w.WriteHeader(http.StatusOK)
-			fmt.Fprintf(w, "Repository not configured for deployment")
-			return
-		}
-
-		if deployErr != nil {
-			slog.Error("Deployment failed", "error", deployErr)
-		} else {
-			slog.Info("Deployment completed successfully")
-		}
-	}()
+	// Check if this is a self-update or target repo deployment
+	if payload.Repository.URL == appConfig.SelfUpdateRepoURL {
+		go func() {
+			if err := deploySelfUpdate(); err != nil {
+				slog.Error("Deployment failed", "error", err)
+			} else {
+				slog.Info("Deployment completed successfully")
+			}
+		}()
+	} else if payload.Repository.URL == appConfig.TargetRepoURL {
+		go func() {
+			if err := deployTargetRepo(payload.Repository.URL); err != nil {
+				slog.Error("Deployment failed", "error", err)
+			} else {
+				slog.Info("Deployment completed successfully")
+			}
+		}()
+	} else {
+		slog.Info("Unknown repository", "url", payload.Repository.URL)
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Repository not configured for deployment")
+		return
+	}
 
 	w.WriteHeader(http.StatusOK)
 }
@@ -233,7 +281,7 @@ func deployTargetRepo(repoURL string) error {
 
 	if _, err := os.Stat(repoDir); os.IsNotExist(err) {
 		slog.Info("Cloning repository", "path", repoDir)
-		if err := runCommand("git", "clone", repoURL, repoDir); err != nil {
+		if err := runCommandInDir("", "git", "clone", repoURL, repoDir); err != nil {
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
 	} else {
@@ -256,14 +304,21 @@ func deployTargetRepo(repoURL string) error {
 	// Run build command
 	if deployConfig.BuildCommand != "" {
 		slog.Info("Running build command", "command", deployConfig.BuildCommand)
-		parts := strings.Fields(deployConfig.BuildCommand)
-		if err := runCommandInDir(repoDir, parts[0], parts[1:]...); err != nil {
+		if err := runShellCommandInDir(repoDir, deployConfig.BuildCommand); err != nil {
 			return fmt.Errorf("build failed: %w", err)
 		}
 	}
 
-	// TODO: Start/stop process management (to be implemented)
-	slog.Info("Process management not yet implemented", "run_command", deployConfig.RunCommand)
+	// Start the process using the process manager
+	workingDir := repoDir
+	if deployConfig.WorkingDir != "" {
+		workingDir = filepath.Join(repoDir, deployConfig.WorkingDir)
+	}
+
+	slog.Info("Starting application process", "command", deployConfig.RunCommand, "working_dir", workingDir)
+	if err := processManager.StartProcess(deployConfig, workingDir); err != nil {
+		return fmt.Errorf("failed to start application process: %w", err)
+	}
 
 	return nil
 }
@@ -290,6 +345,18 @@ func runCommand(dir, command string, args ...string) error {
 
 func runCommandInDir(dir, command string, args ...string) error {
 	cmd := exec.Command(command, args...)
+	if dir != "" {
+		cmd.Dir = dir
+	}
+
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
+}
+
+func runShellCommandInDir(dir, shellCommand string) error {
+	cmd := exec.Command("sh", "-c", shellCommand)
 	if dir != "" {
 		cmd.Dir = dir
 	}
