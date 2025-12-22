@@ -38,6 +38,28 @@ func NewProcessManager() *ProcessManager {
 	}
 }
 
+// GetCurrentPID safely returns the current process PID, or 0 if no process is running
+func (pm *ProcessManager) GetCurrentPID() int {
+	pm.mutex.RLock()
+	defer pm.mutex.RUnlock()
+
+	if pm.currentProcess != nil {
+		return pm.currentProcess.PID
+	}
+	return 0
+}
+
+// GetCurrentWorkingDir returns the working directory of the current process
+func (pm *ProcessManager) GetCurrentWorkingDir() string {
+	pm.mutex.RLock()
+	defer pm.mutex.RUnlock()
+
+	if pm.currentProcess != nil {
+		return pm.currentProcess.WorkingDir
+	}
+	return ""
+}
+
 // StartProcess stops any existing process and starts a new one
 func (pm *ProcessManager) StartProcess(deployConfig *config.DeployConfig, workingDir string) error {
 	pm.mutex.Lock()
@@ -89,17 +111,6 @@ func (pm *ProcessManager) StopCurrentProcess() error {
 	// Stop the process outside of lock
 	err := pm.stopProcessInternal(process)
 	return err
-}
-
-// GetCurrentPID returns the PID of the currently running process, or 0 if none
-func (pm *ProcessManager) GetCurrentPID() int {
-	pm.mutex.RLock()
-	defer pm.mutex.RUnlock()
-
-	if pm.currentProcess == nil {
-		return 0
-	}
-	return pm.currentProcess.PID
 }
 
 // IsRunning returns true if a process is currently running

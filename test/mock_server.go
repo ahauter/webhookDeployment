@@ -71,6 +71,19 @@ func (s *MockWebhookServer) mockWebhookHandler(w http.ResponseWriter, r *http.Re
 	}
 	defer r.Body.Close()
 
+	// Validate payload is not empty
+	if len(body) == 0 {
+		http.Error(w, "Empty request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate JSON structure - reject empty objects
+	trimmedBody := strings.TrimSpace(string(body))
+	if trimmedBody == "{}" {
+		http.Error(w, "Invalid JSON payload - empty object", http.StatusBadRequest)
+		return
+	}
+
 	if !s.verifySignature(body, signature) {
 		http.Error(w, "Invalid signature", http.StatusUnauthorized)
 		return
@@ -78,7 +91,21 @@ func (s *MockWebhookServer) mockWebhookHandler(w http.ResponseWriter, r *http.Re
 
 	var payload GitHubPushPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required GitHub webhook fields
+	if payload.Repository.Name == "" {
+		http.Error(w, "Invalid payload - missing repository name", http.StatusBadRequest)
+		return
+	}
+	if payload.Ref == "" {
+		http.Error(w, "Invalid payload - missing ref", http.StatusBadRequest)
+		return
+	}
+	if payload.HeadCommit.ID == "" {
+		http.Error(w, "Invalid payload - missing commit ID", http.StatusBadRequest)
 		return
 	}
 
@@ -118,7 +145,13 @@ func (s *MockWebhookServer) isAllowedBranch(branch string) bool {
 		return true
 	}
 	for _, allowed := range s.Config.AllowedBranches {
-		if branch == allowed {
+		// Support wildcard patterns like "test-*"
+		if strings.HasSuffix(allowed, "*") {
+			prefix := strings.TrimSuffix(allowed, "*")
+			if strings.HasPrefix(branch, prefix) {
+				return true
+			}
+		} else if branch == allowed {
 			return true
 		}
 	}

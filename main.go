@@ -60,6 +60,22 @@ var (
 )
 
 func main() {
+	// Handle command line flags
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "--version":
+			fmt.Println("binaryDeploy version 1.0.0")
+			return
+		case "--help":
+			fmt.Println("BinaryDeploy - Self-Updating Git Webhook Server")
+			fmt.Println("Usage:")
+			fmt.Println("  binaryDeploy              - Start webhook server")
+			fmt.Println("  binaryDeploy --version    - Show version information")
+			fmt.Println("  binaryDeploy --help       - Show this help message")
+			return
+		}
+	}
+
 	loadConfig()
 	setupLogger()
 
@@ -179,6 +195,21 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("Request body read successfully", "body_size", len(body))
 
+	// Validate payload is not empty
+	if len(body) == 0 {
+		slog.Warn("Empty request body received")
+		http.Error(w, "Empty request body", http.StatusBadRequest)
+		return
+	}
+
+	// Validate JSON structure - reject empty objects
+	trimmedBody := strings.TrimSpace(string(body))
+	if trimmedBody == "{}" {
+		slog.Warn("Empty JSON object received")
+		http.Error(w, "Invalid JSON payload - empty object", http.StatusBadRequest)
+		return
+	}
+
 	if !verifySignature(body, signature) {
 		slog.Warn("Invalid signature verification",
 			"received_signature", signature,
@@ -192,7 +223,24 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	var payload GitHubPushPayload
 	if err := json.Unmarshal(body, &payload); err != nil {
 		slog.Error("Failed to unmarshal JSON payload", "error", err, "body_preview", string(body[:min(200, len(body))]))
-		http.Error(w, "Invalid payload", http.StatusBadRequest)
+		http.Error(w, "Invalid JSON payload", http.StatusBadRequest)
+		return
+	}
+
+	// Validate required GitHub webhook fields
+	if payload.Repository.Name == "" {
+		slog.Warn("Missing repository name in payload")
+		http.Error(w, "Invalid payload - missing repository name", http.StatusBadRequest)
+		return
+	}
+	if payload.Ref == "" {
+		slog.Warn("Missing ref in payload")
+		http.Error(w, "Invalid payload - missing ref", http.StatusBadRequest)
+		return
+	}
+	if payload.HeadCommit.ID == "" {
+		slog.Warn("Missing commit ID in payload")
+		http.Error(w, "Invalid payload - missing commit ID", http.StatusBadRequest)
 		return
 	}
 
@@ -214,19 +262,23 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	// Check if this is a self-update or target repo deployment
 	if payload.Repository.URL == appConfig.SelfUpdateRepoURL {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Deployment triggered for %s", payload.Repository.Name)
 		go func() {
 			if err := deploySelfUpdate(); err != nil {
-				slog.Error("Deployment failed", "error", err)
+				slog.Error("Self-update deployment failed", "error", err)
 			} else {
-				slog.Info("Deployment completed successfully")
+				slog.Info("Self-update deployment completed successfully")
 			}
 		}()
 	} else if payload.Repository.URL == appConfig.TargetRepoURL {
+		w.WriteHeader(http.StatusOK)
+		fmt.Fprintf(w, "Deployment triggered for %s", payload.Repository.Name)
 		go func() {
 			if err := deployTargetRepo(payload.Repository.URL); err != nil {
-				slog.Error("Deployment failed", "error", err)
+				slog.Error("Target deployment failed", "error", err)
 			} else {
-				slog.Info("Deployment completed successfully")
+				slog.Info("Target deployment completed successfully")
 			}
 		}()
 	} else {
@@ -235,8 +287,6 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 		fmt.Fprintf(w, "Repository not configured for deployment")
 		return
 	}
-
-	w.WriteHeader(http.StatusOK)
 }
 
 func verifySignature(body []byte, signature string) bool {
@@ -263,7 +313,13 @@ func isAllowedBranch(branch string) bool {
 		return true
 	}
 	for _, allowed := range appConfig.AllowedBranches {
-		if branch == allowed {
+		// Support wildcard patterns like "test-*"
+		if strings.HasSuffix(allowed, "*") {
+			prefix := strings.TrimSuffix(allowed, "*")
+			if strings.HasPrefix(branch, prefix) {
+				return true
+			}
+		} else if branch == allowed {
 			return true
 		}
 	}

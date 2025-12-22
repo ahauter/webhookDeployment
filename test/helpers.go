@@ -107,7 +107,7 @@ func SetupTestEnvironment(t *testing.T) *TestEnvironment {
 	env.Config = &TestConfig{
 		Port:            "8081",
 		Secret:          "test-webhook-secret",
-		AllowedBranches: []string{"main", "test-branch"},
+		AllowedBranches: []string{"main", "test-branch", "test-*"},
 		LogFile:         env.LogFile,
 	}
 
