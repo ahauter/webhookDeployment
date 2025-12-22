@@ -1,8 +1,8 @@
 {
   "port": "8080",
-  "secret": "your-webhook-secret-here",
-  "target_repo_url": "https://github.com/your-username/your-repo.git",
-  "self_update_repo_url": "https://github.com/your-username/binaryDeploy-updater.git",
+  "secret": "test-secret-for-manual-testing",
+  "target_repo_url": "git@github.com-personal:ahauter/chex.git",
+  "self_update_repo_url": "git@github.com-personal:ahauter/binaryDeploy-updater.git",
   "deploy_dir": "./deployments",
   "self_update_dir": "./self-update",
   "allowed_branches": ["main", "master"],

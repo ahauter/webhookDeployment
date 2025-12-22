@@ -249,6 +249,46 @@ func (pm *ProcessManager) monitorProcess(process *Process) {
 	}
 }
 
+// GetWebStatus returns a map with process status information for web display
+func (pm *ProcessManager) GetWebStatus() map[string]interface{} {
+	pm.mutex.RLock()
+	defer pm.mutex.RUnlock()
+
+	status := map[string]interface{}{
+		"running":       false,
+		"pid":           0,
+		"uptime":        "",
+		"command":       "",
+		"working_dir":   "",
+		"restart_count": 0,
+		"config":        map[string]interface{}{},
+	}
+
+	if pm.currentProcess != nil {
+		uptime := time.Since(pm.currentProcess.StartTime)
+
+		status["running"] = true
+		status["pid"] = pm.currentProcess.PID
+		status["uptime"] = uptime.String()
+		status["command"] = pm.currentProcess.Config.RunCommand
+		status["working_dir"] = pm.currentProcess.WorkingDir
+		status["restart_count"] = pm.currentProcess.RestartCount
+
+		if pm.currentProcess.Config != nil {
+			status["config"] = map[string]interface{}{
+				"build_command": pm.currentProcess.Config.BuildCommand,
+				"run_command":   pm.currentProcess.Config.RunCommand,
+				"working_dir":   pm.currentProcess.Config.WorkingDir,
+				"environment":   pm.currentProcess.Config.Environment,
+				"max_restarts":  pm.currentProcess.Config.MaxRestarts,
+				"restart_delay": pm.currentProcess.Config.RestartDelay,
+			}
+		}
+	}
+
+	return status
+}
+
 // Shutdown stops all processes gracefully
 func (pm *ProcessManager) Shutdown() error {
 	return pm.StopCurrentProcess()

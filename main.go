@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"binaryDeploy/config"
+	"binaryDeploy/monitor"
 	"binaryDeploy/processmanager"
 	"binaryDeploy/updater"
 )
@@ -155,12 +156,219 @@ func loadConfig() {
 
 func setupRoutes() http.Handler {
 	mux := http.NewServeMux()
+
+	// Create monitor handler with server config
+	serverConfig := &monitor.ServerConfig{
+		Port:              appConfig.Port,
+		Secret:            appConfig.Secret,
+		TargetRepoURL:     appConfig.TargetRepoURL,
+		SelfUpdateRepoURL: appConfig.SelfUpdateRepoURL,
+		DeployDir:         appConfig.DeployDir,
+		SelfUpdateDir:     appConfig.SelfUpdateDir,
+		AllowedBranches:   appConfig.AllowedBranches,
+		LogFile:           appConfig.LogFile,
+	}
+
+	monitorHandler := monitor.NewHandler(processManager, serverConfig)
+	monitorHandler.RegisterRoutes(mux)
+
 	mux.HandleFunc("/webhook", webhookHandler)
+
+	// Manual deployment endpoint for testing
+	mux.HandleFunc("/deploy", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			w.Header().Set("Content-Type", "application/json")
+			if err := deployTargetRepo(appConfig.TargetRepoURL); err != nil {
+				w.WriteHeader(http.StatusInternalServerError)
+				json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+			} else {
+				w.WriteHeader(http.StatusOK)
+				json.NewEncoder(w).Encode(map[string]string{"status": "deployment started"})
+			}
+			return
+		}
+		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+	})
+
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Webhook server is running")
 	})
 	return mux
+}
+
+func statusHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "application/json")
+
+	status := map[string]interface{}{
+		"server": map[string]interface{}{
+			"port":             appConfig.Port,
+			"target_repo":      appConfig.TargetRepoURL,
+			"self_update_repo": appConfig.SelfUpdateRepoURL,
+			"allowed_branches": appConfig.AllowedBranches,
+		},
+		"process":   processManager.GetWebStatus(),
+		"timestamp": time.Now().Format(time.RFC3339),
+	}
+
+	json.NewEncoder(w).Encode(status)
+}
+
+func monitorHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+
+	html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binary Deploy Monitor</title>
+    <style>
+        body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; margin: 0; background: #f5f5f5; }
+        .container { max-width: 1200px; margin: 0 auto; padding: 20px; }
+        .header { background: white; padding: 20px; border-radius: 8px; margin-bottom: 20px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .status-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; margin-bottom: 20px; }
+        .card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .status-indicator { display: inline-block; width: 12px; height: 12px; border-radius: 50%; margin-right: 8px; }
+        .status-running { background: #4CAF50; }
+        .status-stopped { background: #f44336; }
+        .status-item { margin: 8px 0; }
+        .label { font-weight: 600; color: #666; }
+        .value { color: #333; }
+        .config-details { background: #f8f9fa; padding: 10px; border-radius: 4px; margin-top: 10px; font-family: monospace; font-size: 12px; }
+        .refresh-btn { background: #007bff; color: white; border: none; padding: 8px 16px; border-radius: 4px; cursor: pointer; }
+        .refresh-btn:hover { background: #0056b3; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🚀 Binary Deploy Monitor</h1>
+            <button class="refresh-btn" onclick="loadStatus()">Refresh</button>
+            <span style="float: right; color: #666; font-size: 14px;" id="last-update"></span>
+        </div>
+        
+        <div class="status-grid">
+            <div class="card">
+                <h3>📡 Server Status</h3>
+                <div class="status-item">
+                    <span class="label">Port:</span>
+                    <span class="value" id="server-port">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Target Repository:</span>
+                    <span class="value" id="target-repo">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Self-Update Repository:</span>
+                    <span class="value" id="self-update-repo">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Allowed Branches:</span>
+                    <span class="value" id="allowed-branches">-</span>
+                </div>
+            </div>
+            
+            <div class="card">
+                <h3>⚡ Process Status</h3>
+                <div class="status-item">
+                    <span class="label">Status:</span>
+                    <span id="process-status">
+                        <span class="status-indicator status-stopped"></span>
+                        <span>Stopped</span>
+                    </span>
+                </div>
+                <div class="status-item">
+                    <span class="label">PID:</span>
+                    <span class="value" id="process-pid">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Uptime:</span>
+                    <span class="value" id="process-uptime">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Restart Count:</span>
+                    <span class="value" id="restart-count">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Command:</span>
+                    <span class="value" id="process-command">-</span>
+                </div>
+                <div class="status-item">
+                    <span class="label">Working Directory:</span>
+                    <span class="value" id="working-dir">-</span>
+                </div>
+            </div>
+        </div>
+        
+        <div class="card">
+            <h3>⚙️ Process Configuration</h3>
+            <div class="config-details" id="process-config">
+                No process running
+            </div>
+        </div>
+    </div>
+
+    <script>
+        function loadStatus() {
+            fetch('/status')
+                .then(response => response.json())
+                .then(data => {
+                    updateServerInfo(data.server);
+                    updateProcessInfo(data.process);
+                    document.getElementById('last-update').textContent = 'Last updated: ' + new Date(data.timestamp).toLocaleTimeString();
+                })
+                .catch(error => {
+                    console.error('Error fetching status:', error);
+                });
+        }
+        
+        function updateServerInfo(server) {
+            document.getElementById('server-port').textContent = server.port;
+            document.getElementById('target-repo').textContent = server.target_repo || 'Not configured';
+            document.getElementById('self-update-repo').textContent = server.self_update_repo || 'Not configured';
+            document.getElementById('allowed-branches').textContent = server.allowed_branches.join(', ') || 'All branches';
+        }
+        
+        function updateProcessInfo(process) {
+            const statusElement = document.getElementById('process-status');
+            if (process.running) {
+                statusElement.innerHTML = '<span class="status-indicator status-running"></span><span>Running</span>';
+                document.getElementById('process-pid').textContent = process.pid;
+                document.getElementById('process-uptime').textContent = process.uptime;
+                document.getElementById('restart-count').textContent = process.restart_count;
+                document.getElementById('process-command').textContent = process.command;
+                document.getElementById('working-dir').textContent = process.working_dir;
+                
+                const config = process.config;
+                let configHtml = '<strong>Build Command:</strong> ' + (config.build_command || 'N/A') + '<br>' +
+                               '<strong>Run Command:</strong> ' + (config.run_command || 'N/A') + '<br>' +
+                               '<strong>Working Dir:</strong> ' + (config.working_dir || 'N/A') + '<br>' +
+                               '<strong>Environment:</strong> ' + (config.environment || 'N/A') + '<br>' +
+                               '<strong>Max Restarts:</strong> ' + (config.max_restarts || 0) + '<br>' +
+                               '<strong>Restart Delay:</strong> ' + (config.restart_delay || 0) + 's';
+                document.getElementById('process-config').innerHTML = configHtml;
+            } else {
+                statusElement.innerHTML = '<span class="status-indicator status-stopped"></span><span>Stopped</span>';
+                document.getElementById('process-pid').textContent = '-';
+                document.getElementById('process-uptime').textContent = '-';
+                document.getElementById('restart-count').textContent = '0';
+                document.getElementById('process-command').textContent = '-';
+                document.getElementById('working-dir').textContent = '-';
+                document.getElementById('process-config').innerHTML = 'No process running';
+            }
+        }
+        
+        // Auto-refresh every 5 seconds
+        setInterval(loadStatus, 5000);
+        
+        // Initial load
+        loadStatus();
+    </script>
+</body>
+</html>`
+
+	fmt.Fprintf(w, html)
 }
 
 func webhookHandler(w http.ResponseWriter, r *http.Request) {
