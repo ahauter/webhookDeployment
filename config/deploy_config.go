@@ -10,24 +10,50 @@ import (
 
 // DeployConfig represents the parsed deploy.config file
 type DeployConfig struct {
-	BuildCommand   string
-	RunCommand     string
-	WorkingDir     string
-	Environment    string
-	Port           int
-	RestartDelay   int
-	MaxRestarts    int
-	BackupBinary   string
-	RestartCommand string
+	// BinaryDeploy Configuration (optional - all have defaults)
+	Port              string
+	LogFile           string
+	LogBufferSize     int
+	DeployDir         string
+	SelfUpdateDir     string
+	SelfUpdateRepoURL string
+
+	// Application Configuration (required)
+	TargetRepoURL   string
+	AllowedBranches string // Comma-separated list
+	Secret          string
+
+	// Application Deployment Settings
+	BuildCommand    string
+	RunCommand      string
+	WorkingDir      string
+	Environment     string
+	ApplicationPort int // Application port, separate from binary port
+	RestartDelay    int
+	MaxRestarts     int
+	BackupBinary    string
+	RestartCommand  string
 }
 
 // DefaultDeployConfig returns a config with sensible defaults
 func DefaultDeployConfig() *DeployConfig {
 	return &DeployConfig{
-		WorkingDir:   "./",
-		Port:         8080,
-		RestartDelay: 5,
-		MaxRestarts:  3,
+		// BinaryDeploy Configuration defaults
+		Port:              "8080",
+		LogFile:           "./binaryDeploy.log",
+		LogBufferSize:     1000,
+		DeployDir:         "./deployments",
+		SelfUpdateDir:     "./self-update",
+		SelfUpdateRepoURL: "https://github.com/ahauter/binaryDeploy-updater.git",
+
+		// Application Configuration defaults
+		AllowedBranches: "main",
+
+		// Application Deployment Settings defaults
+		WorkingDir:      "./",
+		ApplicationPort: 8080,
+		RestartDelay:    5,
+		MaxRestarts:     3,
 	}
 }
 
@@ -64,8 +90,13 @@ func LoadDeployConfig(path string) (*DeployConfig, error) {
 
 	if port, ok := values["port"]; ok {
 		if p, err := strconv.Atoi(port); err == nil {
-			config.Port = p
+			config.ApplicationPort = p
 		}
+	}
+
+	// Handle binary port separately if specified
+	if binaryPort, ok := values["binary_port"]; ok {
+		config.Port = binaryPort
 	}
 
 	if restartDelay, ok := values["restart_delay"]; ok {
@@ -89,7 +120,99 @@ func LoadDeployConfig(path string) (*DeployConfig, error) {
 		config.RestartCommand = restartCmd
 	}
 
+	// Parse binary configuration fields
+	if logFile, ok := values["log_file"]; ok {
+		config.LogFile = logFile
+	}
+
+	if logBufferSize, ok := values["log_buffer_size"]; ok {
+		if size, err := strconv.Atoi(logBufferSize); err == nil && size > 0 {
+			config.LogBufferSize = size
+		}
+	}
+
+	if deployDir, ok := values["deploy_dir"]; ok {
+		config.DeployDir = deployDir
+	}
+
+	if selfUpdateDir, ok := values["self_update_dir"]; ok {
+		config.SelfUpdateDir = selfUpdateDir
+	}
+
+	if selfUpdateRepoURL, ok := values["self_update_repo_url"]; ok {
+		config.SelfUpdateRepoURL = selfUpdateRepoURL
+	}
+
+	// Parse application configuration fields (required)
+	if targetRepoURL, ok := values["target_repo_url"]; ok {
+		config.TargetRepoURL = targetRepoURL
+	} else {
+		return nil, fmt.Errorf("missing required field: target_repo_url")
+	}
+
+	if allowedBranches, ok := values["allowed_branches"]; ok {
+		config.AllowedBranches = allowedBranches
+	} else {
+		return nil, fmt.Errorf("missing required field: allowed_branches")
+	}
+
+	if secret, ok := values["secret"]; ok {
+		config.Secret = secret
+	} else {
+		return nil, fmt.Errorf("missing required field: secret")
+	}
+
 	return config, nil
+}
+
+// ValidateConfig validates the configuration and returns warnings for used defaults
+func ValidateConfig(config *DeployConfig) error {
+	// Check all required fields
+	if config.TargetRepoURL == "" {
+		return fmt.Errorf("missing required field: target_repo_url")
+	}
+	if config.AllowedBranches == "" {
+		return fmt.Errorf("missing required field: allowed_branches")
+	}
+	if config.Secret == "" {
+		return fmt.Errorf("missing required field: secret")
+	}
+	if config.BuildCommand == "" {
+		return fmt.Errorf("missing required field: build_command")
+	}
+	if config.RunCommand == "" {
+		return fmt.Errorf("missing required field: run_command")
+	}
+
+	return nil
+}
+
+// GetDefaultWarnings returns warnings for any default values being used
+func GetDefaultWarnings(config *DeployConfig) []string {
+	var warnings []string
+
+	defaults := DefaultDeployConfig()
+
+	if config.Port == defaults.Port {
+		warnings = append(warnings, "Using default binary port 8080 (add 'port=8080' to deploy.config to customize)")
+	}
+	if config.LogFile == defaults.LogFile {
+		warnings = append(warnings, "Using default log file ./binaryDeploy.log (add 'log_file=...' to deploy.config to customize)")
+	}
+	if config.DeployDir == defaults.DeployDir {
+		warnings = append(warnings, "Using default deploy directory ./deployments (add 'deploy_dir=...' to deploy.config to customize)")
+	}
+	if config.SelfUpdateDir == defaults.SelfUpdateDir {
+		warnings = append(warnings, "Using default self-update directory ./self-update (add 'self_update_dir=...' to deploy.config to customize)")
+	}
+	if config.SelfUpdateRepoURL == defaults.SelfUpdateRepoURL {
+		warnings = append(warnings, "Using default self-update repository (add 'self_update_repo_url=...' to deploy.config to customize)")
+	}
+	if config.AllowedBranches == defaults.AllowedBranches {
+		warnings = append(warnings, "Using default allowed branches 'main' (add 'allowed_branches=...' to deploy.config to customize)")
+	}
+
+	return warnings
 }
 
 // readConfigFile reads and parses a key=value config file

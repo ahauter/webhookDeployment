@@ -49,21 +49,31 @@ go mod tidy
 go build -o binaryDeploy .
 ```
 
-### 2. Configure Webhook Server
+### 2. Configure Application
 
-Create `config.json`:
+Create `deploy.config`:
 
-```json
-{
-  "port": "8080",
-  "secret": "your-webhook-secret-here",
-  "target_repo_url": "https://github.com/your-username/myapp.git",
-  "self_update_repo_url": "https://github.com/your-username/binaryDeploy-updater.git",
-  "deploy_dir": "./deployments",
-  "self_update_dir": "./self-update",
-  "allowed_branches": ["main", "master"],
-  "log_file": "./binaryDeploy.log"
-}
+```
+# Application Configuration (required)
+target_repo_url=https://github.com/your-username/myapp.git
+allowed_branches=main,master
+secret=your-webhook-secret-here
+
+# Application Deployment Settings
+build_command=go build -o myapp .
+run_command=./myapp
+working_dir=./
+environment=production
+port=8080
+restart_delay=5
+max_restarts=3
+
+# BinaryDeploy Configuration (optional)
+# port=8080
+# log_file=./binaryDeploy.log
+# deploy_dir=./deployments
+# self_update_dir=./self-update
+# self_update_repo_url=https://github.com/ahauter/binaryDeploy-updater.git
 ```
 
 ### 3. Run the Server
@@ -81,70 +91,48 @@ Create `config.json`:
 
 The server will start listening on the configured port (default: 8080) for webhook events and write structured JSON logs to `binaryDeploy.log`.
 
-## Repository Setup
+## Configuration
 
-### Target Application Repository
+### Single Configuration File
 
-Add a `deploy.config` file to your application repository:
+BinaryDeploy now uses a single `deploy.config` file that handles both binary and application configuration. This file should be placed in the same directory where you run binaryDeploy.
+
+#### Configuration Fields
+
+| Field | Required | Description | Default |
+|--------|-----------|-------------|----------|
+| **Application Settings** | | | |
+| `target_repo_url` | Yes | GitHub repository URL to deploy | - |
+| `allowed_branches` | Yes | Comma-separated list of branches that trigger deployment | - |
+| `secret` | Yes | GitHub webhook secret for verification | - |
+| `build_command` | Yes | Command to build your application | - |
+| `run_command` | Yes | Command to run your application | - |
+| `working_dir` | No | Working directory for commands | "./" |
+| `environment` | No | Environment setting (e.g., "production") | - |
+| `port` | No | Application port | 8080 |
+| `restart_delay` | No | Delay between restart attempts in seconds | 5 |
+| `max_restarts` | No | Maximum restart attempts | 3 |
+| **BinaryDeploy Settings** | | | |
+| `binary_port` | No | Webhook server port | 8080 |
+| `log_file` | No | Path to structured JSON log file | "./binaryDeploy.log" |
+| `deploy_dir` | No | Directory for application deployments | "./deployments" |
+| `self_update_dir` | No | Directory for self-update operations | "./self-update" |
+| `self_update_repo_url` | No | URL to binaryDeploy updates repository | "https://github.com/ahauter/binaryDeploy-updater.git" |
+
+### Quick Start Example
 
 ```
-# My Application Deployment Configuration
+# Minimum required configuration
+target_repo_url=https://github.com/user/myapp.git
+allowed_branches=main
+secret=my-secret-key
 build_command=go build -o myapp .
 run_command=./myapp
-working_dir=./
-environment=production
-port=8080
-restart_delay=5
-max_restarts=3
 ```
 
-### Self-Update Repository
+**Important**: Add `deploy.config` to `.gitignore` to prevent webhook secret exposure!
 
-Create a separate repository (e.g., `binaryDeploy-updater`) with:
 
-```
-# BinaryDeploy Self-Update Configuration
-build_command=go build -o binaryDeploy .
-restart_command=systemctl restart webhook
-backup_binary=/opt/binaryDeploy/binaryDeploy.backup
-```
-
-**Important**: Add `deploy.config` to `.gitignore` in both repositories to prevent secrets exposure!
-
-## Configuration Reference
-
-### config.json (Webhook Server)
-
-| Field | Type | Description |
-|-------|------|-------------|
-| `port` | string | Server port (default: 8080) |
-| `secret` | string | GitHub webhook secret for verification |
-| `target_repo_url` | string | URL to your application repository |
-| `self_update_repo_url` | string | URL to binaryDeploy updates repository |
-| `deploy_dir` | string | Directory for target application deployments |
-| `self_update_dir` | string | Directory for self-update operations |
-| `allowed_branches` | array | Branches that trigger deployments |
-| `log_file` | string | Path to structured JSON log file (default: "./binaryDeploy.log") |
-
-### deploy.config (Application Repository)
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `build_command` | Yes | Command to build your application |
-| `run_command` | Yes | Command to run your application |
-| `working_dir` | No | Working directory for commands (default: "./") |
-| `environment` | No | Environment setting (e.g., "production") |
-| `port` | No | Application port (default: 8080) |
-| `restart_delay` | No | Delay between restart attempts in seconds |
-| `max_restarts` | No | Maximum restart attempts |
-
-### deploy.config (Self-Update Repository)
-
-| Field | Required | Description |
-|-------|----------|-------------|
-| `build_command` | Yes | Command to build new binaryDeploy binary |
-| `restart_command` | No | Command to restart webhook service |
-| `backup_binary` | No | Path for backup binary (default: "./binaryDeploy.backup") |
 
 ## Process Management
 
@@ -224,19 +212,12 @@ go test -cover ./test/...
 ```
 binaryDeploy/
 ├── main.go                    # Main webhook server
+├── deploy.config              # Unified configuration
+├── README.md
 ├── config/
 │   └── deploy_config.go      # Configuration parsing
-├── processmanager/
-│   ├── manager.go            # Process lifecycle management
-│   └── manager_test.go       # Process manager tests
 ├── updater/
 │   └── self_update.go        # Self-update functionality
-├── test/                     # Comprehensive test suite
-│   ├── e2e_*_test.go        # End-to-end tests
-│   ├── integration_test.go   # Integration tests
-│   ├── security_test.go      # Security validation
-│   └── helpers.go           # Test utilities
-├── config.json              # Server configuration
 └── README.md
 ```
 

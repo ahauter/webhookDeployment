@@ -15,6 +15,7 @@ import (
 	"os/signal"
 	"path/filepath"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -32,17 +33,6 @@ func min(a, b int) int {
 	return b
 }
 
-type Config struct {
-	Port              string   `json:"port"`
-	Secret            string   `json:"secret"`
-	TargetRepoURL     string   `json:"target_repo_url"`
-	SelfUpdateRepoURL string   `json:"self_update_repo_url"`
-	DeployDir         string   `json:"deploy_dir"`
-	SelfUpdateDir     string   `json:"self_update_dir"`
-	AllowedBranches   []string `json:"allowed_branches"`
-	LogFile           string   `json:"log_file"`
-}
-
 type GitHubPushPayload struct {
 	Ref        string `json:"ref"`
 	Repository struct {
@@ -55,9 +45,25 @@ type GitHubPushPayload struct {
 	} `json:"head_commit"`
 }
 
+type UpdateStatus struct {
+	IsRunning   bool      `json:"is_running"`
+	StartTime   time.Time `json:"start_time"`
+	Message     string    `json:"message"`
+	Error       string    `json:"error,omitempty"`
+	CompletedAt time.Time `json:"completed_at,omitempty"`
+}
+
 var (
-	appConfig      Config
+	appConfig      *config.DeployConfig
 	processManager *processmanager.ProcessManager
+	updateStatus   = struct {
+		sync.RWMutex
+		target UpdateStatus `json:"target"`
+		self   UpdateStatus `json:"self"`
+	}{
+		target: UpdateStatus{IsRunning: false},
+		self:   UpdateStatus{IsRunning: false},
+	}
 )
 
 func main() {
@@ -96,6 +102,19 @@ func main() {
 		}
 	}()
 
+	// Auto-start target app after server initialization
+	go func() {
+		// Give server a moment to start up
+		time.Sleep(3 * time.Second)
+
+		slog.Info("Auto-starting target application", "repo", appConfig.TargetRepoURL)
+		if err := deployTargetRepo(appConfig.TargetRepoURL); err != nil {
+			slog.Error("Auto-start deployment failed", "error", err)
+		} else {
+			slog.Info("Target application auto-started successfully")
+		}
+	}()
+
 	quit := make(chan os.Signal, 1)
 	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
 	<-quit
@@ -127,35 +146,504 @@ func setupLogger() {
 		panic(err)
 	}
 
-	logger := slog.New(slog.NewJSONHandler(logFile, nil))
+	// Create base JSON handler for file logging
+	baseHandler := slog.NewJSONHandler(logFile, nil)
+
+	// Wrap with streaming handler for real-time logs
+	globalLogStreamer = NewLogStreamer(baseHandler, appConfig.LogBufferSize)
+
+	logger := slog.New(globalLogStreamer)
 	slog.SetDefault(logger)
 }
 
 func loadConfig() {
-	configFile := "config.json"
+	configFile := "deploy.config"
 	if _, err := os.Stat(configFile); os.IsNotExist(err) {
-		slog.Error("Config file not found", "file", configFile)
+		fmt.Fprintf(os.Stderr, "Error: deploy.config file not found\n")
+		fmt.Fprintf(os.Stderr, "Please create a deploy.config file with your application and binary configuration.\n")
+		fmt.Fprintf(os.Stderr, "\nExample deploy.config:\n")
+		fmt.Fprintf(os.Stderr, "# Application Configuration (required)\n")
+		fmt.Fprintf(os.Stderr, "target_repo_url=https://github.com/user/myapp.git\n")
+		fmt.Fprintf(os.Stderr, "allowed_branches=main\n")
+		fmt.Fprintf(os.Stderr, "secret=your-webhook-secret-here\n")
+		fmt.Fprintf(os.Stderr, "\n# Application Deployment Settings\n")
+		fmt.Fprintf(os.Stderr, "build_command=go build -o myapp .\n")
+		fmt.Fprintf(os.Stderr, "run_command=./myapp\n")
+		fmt.Fprintf(os.Stderr, "\n# BinaryDeploy Configuration (optional)\n")
+		fmt.Fprintf(os.Stderr, "# port=8080\n")
+		fmt.Fprintf(os.Stderr, "# log_file=./binaryDeploy.log\n")
+		fmt.Fprintf(os.Stderr, "# self_update_repo_url=https://github.com/ahauter/binaryDeploy-updater.git\n")
 		os.Exit(1)
 	}
 
-	data, err := os.ReadFile(configFile)
+	// Load configuration using the config package
+	deployConfig, err := config.LoadDeployConfig(configFile)
 	if err != nil {
-		slog.Error("Failed to read config file", "error", err)
+		fmt.Fprintf(os.Stderr, "Error loading deploy.config: %v\n", err)
 		os.Exit(1)
 	}
 
-	if err := json.Unmarshal(data, &appConfig); err != nil {
-		slog.Error("Failed to parse config file", "error", err)
+	// Validate required fields
+	if err := config.ValidateConfig(deployConfig); err != nil {
+		fmt.Fprintf(os.Stderr, "Configuration validation failed: %v\n", err)
 		os.Exit(1)
 	}
 
-	if appConfig.Port == "" {
-		appConfig.Port = "8080"
+	// Show warnings for any default values being used
+	warnings := config.GetDefaultWarnings(deployConfig)
+	for _, warning := range warnings {
+		fmt.Fprintf(os.Stderr, "Warning: %s\n", warning)
 	}
+
+	appConfig = deployConfig
+}
+
+func logsOnlyHandler(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Content-Type", "text/html")
+
+	// Full-screen logs page HTML
+	html := `<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Binary Deploy - Live Logs</title>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
+    <style>
+        :root {
+            --bg-color: #0d1117;
+            --card-bg: #161b22;
+            --border-color: #30363d;
+            --text-primary: #e6edf3;
+            --text-secondary: #8b949e;
+            --text-muted: #656d76;
+        }
+
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+            background: var(--bg-color);
+            color: var(--text-primary);
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            overflow: hidden;
+        }
+
+        .header {
+            background: var(--card-bg);
+            border-bottom: 1px solid var(--border-color);
+            padding: 1rem 2rem;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            flex-shrink: 0;
+        }
+
+        .header-title {
+            display: flex;
+            align-items: center;
+            gap: 1rem;
+            font-size: 1.25rem;
+            font-weight: 600;
+        }
+
+        .header-controls {
+            display: flex;
+            gap: 1rem;
+            align-items: center;
+        }
+
+        .btn {
+            background: var(--card-bg);
+            color: var(--text-primary);
+            border: 1px solid var(--border-color);
+            padding: 0.5rem 1rem;
+            border-radius: 0.375rem;
+            cursor: pointer;
+            font-weight: 500;
+            font-size: 0.875rem;
+            transition: all 0.2s ease;
+            display: flex;
+            align-items: center;
+            gap: 0.5rem;
+            text-decoration: none;
+        }
+
+        .btn:hover {
+            background: #21262d;
+            transform: translateY(-1px);
+        }
+
+        .btn:active {
+            transform: translateY(0);
+        }
+
+        .log-status {
+            font-size: 0.875rem;
+            font-weight: 500;
+        }
+
+        .log-container-wrapper {
+            flex: 1;
+            display: flex;
+            flex-direction: column;
+            padding: 1rem;
+            overflow: hidden;
+        }
+
+        .log-container {
+            background: #0d1117;
+            color: #e6edf3;
+            font-family: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', 'Courier New', monospace;
+            font-size: 0.8rem;
+            flex: 1;
+            overflow-y: auto;
+            padding: 1rem;
+            border-radius: 0.375rem;
+            line-height: 1.6;
+            border: 1px solid var(--border-color);
+        }
+
+        .log-entry {
+            margin-bottom: 0.5rem;
+            padding: 0.5rem;
+            border-radius: 0.375rem;
+            word-break: break-all;
+            position: relative;
+            transition: all 0.2s ease;
+            border-left: 3px solid transparent;
+            animation: logFadeIn 0.3s ease-in-out;
+        }
+
+        @keyframes logFadeIn {
+            from {
+                opacity: 0;
+                transform: translateY(-10px);
+            }
+            to {
+                opacity: 1;
+                transform: translateY(0);
+            }
+        }
+
+        .log-entry:hover {
+            background: rgba(255, 255, 255, 0.05);
+            transform: translateX(2px);
+        }
+
+        .log-entry.error {
+            background: linear-gradient(135deg, rgba(239, 68, 68, 0.15), rgba(239, 68, 68, 0.05));
+            border-left-color: #ef4444;
+            color: #fca5a5;
+        }
+
+        .log-entry.error .log-timestamp,
+        .log-entry.error .log-level {
+            color: #fca5a5 !important;
+        }
+
+        .log-entry.warn {
+            background: linear-gradient(135deg, rgba(245, 158, 11, 0.15), rgba(245, 158, 11, 0.05));
+            border-left-color: #f59e0b;
+            color: #fcd34d;
+        }
+
+        .log-entry.warn .log-timestamp,
+        .log-entry.warn .log-level {
+            color: #fcd34d !important;
+        }
+
+        .log-entry.info {
+            background: linear-gradient(135deg, rgba(59, 130, 246, 0.15), rgba(59, 130, 246, 0.05));
+            border-left-color: #3b82f6;
+            color: #93c5fd;
+        }
+
+        .log-entry.info .log-timestamp,
+        .log-entry.info .log-level {
+            color: #93c5fd !important;
+        }
+
+        .log-entry.debug {
+            background: linear-gradient(135deg, rgba(139, 92, 246, 0.15), rgba(139, 92, 246, 0.05));
+            border-left-color: #8b5cf6;
+            color: #c4b5fd;
+        }
+
+        .log-entry.debug .log-timestamp,
+        .log-entry.debug .log-level {
+            color: #c4b5fd !important;
+        }
+
+        .log-timestamp {
+            color: #8b949e;
+            font-size: 0.75rem;
+            font-weight: 500;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+            margin-right: 0.75rem;
+        }
+
+        .log-level {
+            font-weight: 600;
+            font-size: 0.8rem;
+            padding: 0.125rem 0.5rem;
+            border-radius: 0.375rem;
+            margin-right: 0.75rem;
+            text-transform: uppercase;
+            letter-spacing: 0.05em;
+        }
+
+        .log-message {
+            color: #e6edf3;
+            font-weight: 400;
+        }
+
+        .log-fields {
+            margin-top: 0.25rem;
+            font-size: 0.8rem;
+            color: #8b949e;
+            font-style: italic;
+        }
+
+        .log-field {
+            margin-right: 1rem;
+        }
+
+        .log-field-key {
+            color: #f97316;
+            font-weight: 500;
+        }
+
+        .log-field-value {
+            color: #10b981;
+        }
+
+        .log-container::-webkit-scrollbar {
+            width: 8px;
+        }
+
+        .log-container::-webkit-scrollbar-track {
+            background: #21262d;
+            border-radius: 0.375rem;
+        }
+
+        .log-container::-webkit-scrollbar-thumb {
+            background: #30363d;
+            border-radius: 0.375rem;
+            border: 1px solid #21262d;
+        }
+
+        .log-container::-webkit-scrollbar-thumb:hover {
+            background: #484f58;
+        }
+
+        .empty-state {
+            text-align: center;
+            padding: 3rem 1rem;
+            color: var(--text-muted);
+        }
+
+        .empty-state-icon {
+            font-size: 3rem;
+            margin-bottom: 1rem;
+            opacity: 0.5;
+        }
+
+        .empty-state-text {
+            font-weight: 500;
+            margin-bottom: 0.5rem;
+        }
+
+        .empty-state-subtext {
+            font-size: 0.875rem;
+            opacity: 0.7;
+        }
+
+        .connecting {
+            animation: pulse 1.5s infinite;
+        }
+
+        @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+        }
+
+        .error {
+            animation: blink 2s infinite;
+        }
+
+        @keyframes blink {
+            0%, 50%, 100% { opacity: 1; }
+            25%, 75% { opacity: 0.3; }
+        }
+    </style>
+</head>
+<body>
+    <header class="header">
+        <div class="header-title">
+            <span>📋</span>
+            <span>Binary Deploy - Live Logs</span>
+            <span class="log-status" id="log-status">🟡 Connecting...</span>
+        </div>
+        <div class="header-controls">
+            <button class="btn" onclick="toggleLogStream()" id="logToggleBtn">
+                <span>⏸️</span>
+                <span>Pause</span>
+            </button>
+            <button class="btn" onclick="clearLogs()" id="logClearBtn">
+                <span>🗑️</span>
+                <span>Clear</span>
+            </button>
+            <a href="/monitor" class="btn" target="_blank">
+                <span>🔙</span>
+                <span>Dashboard</span>
+            </a>
+        </div>
+    </header>
+
+    <div class="log-container-wrapper">
+        <div class="log-container" id="log-container">
+            <div class="empty-state">
+                <div class="empty-state-icon">⏳</div>
+                <div class="empty-state-text">Connecting to log stream...</div>
+                <div class="empty-state-subtext">Real-time logs will appear here</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let eventSource;
+        let isLogStreamActive = true;
+        let logEntryCount = 0;
+        let maxLogEntries = 1000;
+
+        function connectLogStream() {
+            const statusElement = document.getElementById('log-status');
+            statusElement.textContent = '🟡 Connecting...';
+            statusElement.className = 'log-status connecting';
+
+            eventSource = new EventSource('/logs');
+            
+            eventSource.onopen = function() {
+                statusElement.textContent = '🟢 Connected';
+                statusElement.className = 'log-status';
+                console.log('Log stream connected');
+            };
+            
+            eventSource.onmessage = function(event) {
+                try {
+                    const logEntry = JSON.parse(event.data);
+                    if (isLogStreamActive) {
+                        appendLogEntry(logEntry);
+                    }
+                } catch (error) {
+                    console.error('Error parsing log entry:', error, event.data);
+                }
+            };
+            
+            eventSource.onerror = function() {
+                statusElement.textContent = '🔴 Disconnected';
+                statusElement.className = 'log-status error';
+                console.error('Log stream disconnected, attempting to reconnect...');
+                
+                setTimeout(() => {
+                    connectLogStream();
+                }, 5000);
+            };
+        }
+
+        function appendLogEntry(logEntry) {
+            const container = document.getElementById('log-container');
+            
+            if (logEntryCount === 0) {
+                container.innerHTML = '';
+            }
+
+            const entry = document.createElement('div');
+            entry.className = 'log-entry ' + logEntry.level.toLowerCase();
+            
+            const timestamp = new Date(logEntry.timestamp).toLocaleTimeString();
+            
+            let logHTML = '<span class="log-timestamp">' + timestamp + '</span>' +
+                '<span class="log-level" style="background-color: ' + logEntry.color + '20; color: ' + logEntry.color + '; border: 1px solid ' + logEntry.color + '40;">' + logEntry.level + '</span>' +
+                '<span class="log-message">' + logEntry.message + '</span>';
+
+            if (logEntry.fields && Object.keys(logEntry.fields).length > 0) {
+                const fieldParts = [];
+                for (const [key, value] of Object.entries(logEntry.fields)) {
+                    fieldParts.push('<span class="log-field"><span class="log-field-key">' + key + '</span>=<span class="log-field-value">' + value + '</span></span>');
+                }
+                logHTML += '<div class="log-fields">' + fieldParts.join(' ') + '</div>';
+            }
+
+            entry.innerHTML = logHTML;
+            container.appendChild(entry);
+            logEntryCount++;
+
+            while (container.children.length > maxLogEntries) {
+                container.removeChild(container.firstChild);
+            }
+
+            container.scrollTop = container.scrollHeight;
+
+            if (logEntry.level === 'ERROR') {
+                entry.style.animation = 'pulse 2s';
+            }
+        }
+
+        function toggleLogStream() {
+            isLogStreamActive = !isLogStreamActive;
+            const btn = document.getElementById('logToggleBtn');
+            
+            if (isLogStreamActive) {
+                btn.innerHTML = '<span>⏸️</span><span>Pause</span>';
+            } else {
+                btn.innerHTML = '<span>▶️</span><span>Resume</span>';
+            }
+        }
+
+        function clearLogs() {
+            const container = document.getElementById('log-container');
+            container.innerHTML = '<div class="empty-state">' +
+                '<div class="empty-state-icon">🗑️</div>' +
+                '<div class="empty-state-text">Logs cleared</div>' +
+                '<div class="empty-state-subtext">New logs will appear here</div>' +
+                '</div>';
+            logEntryCount = 0;
+        }
+
+        // Initialize
+        connectLogStream();
+
+        // Keyboard shortcut for pause/resume
+        document.addEventListener('keydown', (e) => {
+            if (e.code === 'Space') {
+                e.preventDefault();
+                toggleLogStream();
+            }
+        });
+    </script>
+</body>
+</html>`
+
+	fmt.Fprintf(w, html)
 }
 
 func setupRoutes() http.Handler {
 	mux := http.NewServeMux()
+
+	// Convert comma-separated branches to array for monitor
+	allowedBranches := strings.Split(appConfig.AllowedBranches, ",")
+	for i, branch := range allowedBranches {
+		allowedBranches[i] = strings.TrimSpace(branch)
+	}
 
 	// Create monitor handler with server config
 	serverConfig := &monitor.ServerConfig{
@@ -165,7 +653,7 @@ func setupRoutes() http.Handler {
 		SelfUpdateRepoURL: appConfig.SelfUpdateRepoURL,
 		DeployDir:         appConfig.DeployDir,
 		SelfUpdateDir:     appConfig.SelfUpdateDir,
-		AllowedBranches:   appConfig.AllowedBranches,
+		AllowedBranches:   allowedBranches,
 		LogFile:           appConfig.LogFile,
 	}
 
@@ -185,10 +673,154 @@ func setupRoutes() http.Handler {
 				w.WriteHeader(http.StatusOK)
 				json.NewEncoder(w).Encode(map[string]string{"status": "deployment started"})
 			}
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Force update target app endpoint
+	mux.HandleFunc("/update-target", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// Mark update as starting
+			updateStatus.Lock()
+			updateStatus.target = UpdateStatus{
+				IsRunning: true,
+				StartTime: time.Now(),
+				Message:   "Target app update started",
+			}
+			updateStatus.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":    "Target app update started",
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+
+			// Run deployment asynchronously
+			go func() {
+				if err := deployTargetRepo(appConfig.TargetRepoURL); err != nil {
+					slog.Error("Manual target app update failed", "error", err)
+					updateStatus.Lock()
+					updateStatus.target.IsRunning = false
+					updateStatus.target.Error = err.Error()
+					updateStatus.target.Message = "Target app update failed"
+					updateStatus.target.CompletedAt = time.Now()
+					updateStatus.Unlock()
+				} else {
+					slog.Info("Manual target app update completed successfully")
+					updateStatus.Lock()
+					updateStatus.target.IsRunning = false
+					updateStatus.target.Message = "Target app update completed successfully"
+					updateStatus.target.CompletedAt = time.Now()
+					updateStatus.Unlock()
+				}
+			}()
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Update status endpoint
+	mux.HandleFunc("/update-status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			updateStatus.RLock()
+			status := map[string]interface{}{
+				"target": updateStatus.target,
+				"self":   updateStatus.self,
+			}
+			updateStatus.RUnlock()
+			json.NewEncoder(w).Encode(status)
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// Force update self endpoint
+	mux.HandleFunc("/update-self", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			// Mark update as starting
+			updateStatus.Lock()
+			updateStatus.self = UpdateStatus{
+				IsRunning: true,
+				StartTime: time.Now(),
+				Message:   "Self update started",
+			}
+			updateStatus.Unlock()
+
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			json.NewEncoder(w).Encode(map[string]string{
+				"status":    "Self update started",
+				"timestamp": time.Now().Format(time.RFC3339),
+			})
+
+			// Run self update asynchronously
+			go func() {
+				if err := deploySelfUpdate(); err != nil {
+					slog.Error("Manual self update failed", "error", err)
+					updateStatus.Lock()
+					updateStatus.self.IsRunning = false
+					updateStatus.self.Error = err.Error()
+					updateStatus.self.Message = "Self update failed"
+					updateStatus.self.CompletedAt = time.Now()
+					updateStatus.Unlock()
+				} else {
+					slog.Info("Manual self update completed successfully")
+					updateStatus.Lock()
+					updateStatus.self.IsRunning = false
+					updateStatus.self.Message = "Self update completed successfully"
+					updateStatus.self.CompletedAt = time.Now()
+					updateStatus.Unlock()
+				}
+			}()
+		} else {
+			http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+		}
+	})
+
+	// SSE endpoint for real-time log streaming
+	mux.HandleFunc("/logs", func(w http.ResponseWriter, r *http.Request) {
+		// Set SSE headers
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.Header().Set("Cache-Control", "no-cache")
+		w.Header().Set("Connection", "keep-alive")
+		w.Header().Set("Access-Control-Allow-Origin", "*")
+		w.Header().Set("Access-Control-Allow-Headers", "Cache-Control")
+
+		// Get flusher for SSE
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			http.Error(w, "Streaming unsupported", http.StatusInternalServerError)
 			return
 		}
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
+
+		// Create client channel
+		clientChan := make(chan []byte, 100)
+		globalLogStreamer.AddClient(clientChan)
+		defer globalLogStreamer.RemoveClient(clientChan)
+
+		// Send buffered logs first
+		for _, logEntry := range globalLogStreamer.GetBufferedLogs() {
+			fmt.Fprintf(w, "data: %s\n\n", logEntry)
+			flusher.Flush()
+		}
+
+		// Stream new logs
+		for {
+			select {
+			case logEntry := <-clientChan:
+				fmt.Fprintf(w, "data: %s\n\n", logEntry)
+				flusher.Flush()
+			case <-r.Context().Done():
+				return
+			}
+		}
 	})
+
+	// Logs-only page endpoint
+	mux.HandleFunc("/logs-only", logsOnlyHandler)
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
@@ -388,7 +1020,8 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 	}
 
 	signature := r.Header.Get("X-Hub-Signature-256")
-	if signature == "" {
+	// Only require signature if secret is configured
+	if appConfig.Secret != "" && signature == "" {
 		http.Error(w, "Missing signature", http.StatusUnauthorized)
 		return
 	}
@@ -468,32 +1101,68 @@ func webhookHandler(w http.ResponseWriter, r *http.Request) {
 
 	slog.Info("Received push event", "branch", branch, "repository", payload.Repository.Name)
 
-	// Check if this is a self-update or target repo deployment
+	// Check if this is a self-update deployment
 	if payload.Repository.URL == appConfig.SelfUpdateRepoURL {
+		// Mark self-update as starting
+		updateStatus.Lock()
+		updateStatus.self = UpdateStatus{
+			IsRunning: true,
+			StartTime: time.Now(),
+			Message:   fmt.Sprintf("Webhook self-update triggered for %s", payload.Repository.Name),
+		}
+		updateStatus.Unlock()
+
 		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Deployment triggered for %s", payload.Repository.Name)
+		fmt.Fprintf(w, "Self-update deployment triggered for %s", payload.Repository.Name)
 		go func() {
 			if err := deploySelfUpdate(); err != nil {
 				slog.Error("Self-update deployment failed", "error", err)
+				updateStatus.Lock()
+				updateStatus.self.IsRunning = false
+				updateStatus.self.Error = err.Error()
+				updateStatus.self.Message = "Webhook self-update failed"
+				updateStatus.self.CompletedAt = time.Now()
+				updateStatus.Unlock()
 			} else {
 				slog.Info("Self-update deployment completed successfully")
+				updateStatus.Lock()
+				updateStatus.self.IsRunning = false
+				updateStatus.self.Message = "Webhook self-update completed successfully"
+				updateStatus.self.CompletedAt = time.Now()
+				updateStatus.Unlock()
 			}
 		}()
-	} else if payload.Repository.URL == appConfig.TargetRepoURL {
+	} else {
+		// Mark target update as starting
+		updateStatus.Lock()
+		updateStatus.target = UpdateStatus{
+			IsRunning: true,
+			StartTime: time.Now(),
+			Message:   fmt.Sprintf("Webhook deployment triggered for %s", payload.Repository.Name),
+		}
+		updateStatus.Unlock()
+
+		// Deploy any repository (repo-agnostic approach)
 		w.WriteHeader(http.StatusOK)
 		fmt.Fprintf(w, "Deployment triggered for %s", payload.Repository.Name)
 		go func() {
 			if err := deployTargetRepo(payload.Repository.URL); err != nil {
 				slog.Error("Target deployment failed", "error", err)
+				updateStatus.Lock()
+				updateStatus.target.IsRunning = false
+				updateStatus.target.Error = err.Error()
+				updateStatus.target.Message = "Webhook deployment failed"
+				updateStatus.target.CompletedAt = time.Now()
+				updateStatus.Unlock()
 			} else {
 				slog.Info("Target deployment completed successfully")
+				updateStatus.Lock()
+				updateStatus.target.IsRunning = false
+				updateStatus.target.Message = "Webhook deployment completed successfully"
+				updateStatus.target.CompletedAt = time.Now()
+				updateStatus.Unlock()
 			}
 		}()
-	} else {
-		slog.Info("Unknown repository", "url", payload.Repository.URL)
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprintf(w, "Repository not configured for deployment")
-		return
 	}
 }
 
@@ -517,10 +1186,12 @@ func extractBranchFromRef(ref string) string {
 }
 
 func isAllowedBranch(branch string) bool {
-	if len(appConfig.AllowedBranches) == 0 {
+	allowedBranches := strings.Split(appConfig.AllowedBranches, ",")
+	if len(allowedBranches) == 0 || (len(allowedBranches) == 1 && allowedBranches[0] == "") {
 		return true
 	}
-	for _, allowed := range appConfig.AllowedBranches {
+	for _, allowed := range allowedBranches {
+		allowed = strings.TrimSpace(allowed)
 		// Support wildcard patterns like "test-*"
 		if strings.HasSuffix(allowed, "*") {
 			prefix := strings.TrimSuffix(allowed, "*")
@@ -558,12 +1229,8 @@ func deployTargetRepo(repoURL string) error {
 		}
 	}
 
-	// Read deploy config from the cloned repository
-	configPath := filepath.Join(repoDir, "deploy.config")
-	deployConfig, err := config.LoadDeployConfig(configPath)
-	if err != nil {
-		return fmt.Errorf("reading deploy config: %w", err)
-	}
+	// Use deploy config from main configuration (not from cloned repo)
+	deployConfig := appConfig
 
 	// Run build command
 	if deployConfig.BuildCommand != "" {

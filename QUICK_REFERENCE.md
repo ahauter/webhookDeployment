@@ -4,7 +4,7 @@
 ```
 binaryDeploy/
 ├── main.go
-├── config.json
+├── deploy.config
 ├── README.md
 ├── config/
 │   └── deploy_config.go
@@ -22,44 +22,49 @@ go build -o binaryDeploy .
 
 # Install (production)
 sudo mkdir -p /opt/binaryDeploy
-sudo cp binaryDeploy config.json /opt/binaryDeploy/
+sudo cp binaryDeploy deploy.config /opt/binaryDeploy/
 sudo systemctl enable --now webhook
 ```
 
-## Configuration Templates
+## Configuration Template
 
-### config.json
-```json
-{
-  "port": "8080",
-  "secret": "generate-secure-random-string",
-  "target_repo_url": "https://github.com/user/app.git",
-  "self_update_repo_url": "https://github.com/user/binaryDeploy-updater.git",
-  "deploy_dir": "./deployments",
-  "self_update_dir": "./self-update",
-  "allowed_branches": ["main"]
-}
+### deploy.config (Single Configuration File)
 ```
+# Application Configuration (required)
+target_repo_url=https://github.com/user/app.git
+allowed_branches=main
+secret=generate-secure-random-string
 
-### Application Repository deploy.config
-```
-# App deployment
+# Application Deployment Settings
 build_command=go build -o app .
 run_command=./app
 working_dir=./
+environment=production
 port=8080
-```
+restart_delay=5
+max_restarts=3
 
-### Self-Update Repository deploy.config
-```
-# BinaryDeploy self-update
-build_command=go build -o binaryDeploy .
-restart_command=systemctl restart webhook
-backup_binary=/opt/binaryDeploy/binaryDeploy.backup
+# BinaryDeploy Configuration (optional)
+# port=8080
+# log_file=./binaryDeploy.log
+# deploy_dir=./deployments
+# self_update_dir=./self-update
+# self_update_repo_url=https://github.com/ahauter/binaryDeploy-updater.git
 ```
 
 ## Common Workflow
-1. Push to app repo → App rebuilds
-2. Push to binaryDeploy-updater repo → binaryDeploy updates itself
-3. Both use same webhook URL
-4. Automatic rollback on any failure
+1. Create deploy.config with your settings
+2. Run binaryDeploy → webhook server starts
+3. Push to configured repo → Automatic deployment
+4. Push to binaryDeploy-updater repo → binaryDeploy updates itself
+5. Automatic rollback on any failure
+
+## Migration from config.json
+Old config.json fields map to deploy.config:
+- `port` → `port` (binary webhook port)
+- `secret` → `secret`
+- `target_repo_url` → `target_repo_url`
+- `self_update_repo_url` → `self_update_repo_url`
+- `deploy_dir` → `deploy_dir`
+- `self_update_dir` → `self_update_dir`
+- `allowed_branches` → `allowed_branches` (comma-separated instead of array)

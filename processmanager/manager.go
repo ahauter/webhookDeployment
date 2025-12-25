@@ -6,6 +6,8 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"strconv"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -68,8 +70,10 @@ func (pm *ProcessManager) StartProcess(deployConfig *config.DeployConfig, workin
 	// Stop any existing process first
 	if pm.currentProcess != nil {
 		if err := pm.stopProcessInternal(pm.currentProcess); err != nil {
-			pm.logger.Warn("Failed to stop existing process", "error", err)
+			pm.logger.Error("Failed to stop existing process", "error", err)
+			return fmt.Errorf("failed to stop existing process before starting new one: %w", err)
 		}
+		pm.logger.Info("Existing process stopped successfully")
 	}
 
 	// Create and start new process
@@ -130,6 +134,13 @@ func (pm *ProcessManager) createProcess(deployConfig *config.DeployConfig, worki
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
 
+	// Set up process group for better signal handling
+	cmd.SysProcAttr = &syscall.SysProcAttr{
+		Setpgid: true, // Create new process group (this process becomes group leader)
+	}
+
+	pm.logger.Info("Creating process with process group support", "command", deployConfig.RunCommand)
+
 	return &Process{
 		Config:     deployConfig,
 		WorkingDir: workingDir,
@@ -150,6 +161,56 @@ func (pm *ProcessManager) startProcessInternal(process *Process) error {
 	return nil
 }
 
+// isExpectedTerminationError checks if the error is expected for normal process termination
+func isExpectedTerminationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	errStr := err.Error()
+	return strings.Contains(errStr, "signal: terminated") ||
+		strings.Contains(errStr, "signal: killed") ||
+		strings.Contains(errStr, "exit status")
+}
+
+// getProcessGroupID retrieves the process group ID for a given process
+func (pm *ProcessManager) getProcessGroupID(pid int) (int, error) {
+	_, err := os.FindProcess(pid)
+	if err != nil {
+		return 0, fmt.Errorf("process not found: %w", err)
+	}
+
+	// Read process status to get PGID
+	statPath := fmt.Sprintf("/proc/%d/stat", pid)
+	data, err := os.ReadFile(statPath)
+	if err != nil {
+		return 0, fmt.Errorf("cannot read process stat: %w", err)
+	}
+
+	fields := strings.Fields(string(data))
+	if len(fields) < 5 {
+		return 0, fmt.Errorf("invalid stat format")
+	}
+
+	pgid, err := strconv.Atoi(fields[4]) // Field 4 is PGID
+	if err != nil {
+		return 0, fmt.Errorf("invalid pgid: %w", err)
+	}
+
+	return pgid, nil
+}
+
+// isProcessDead checks if a process with given PID is actually terminated
+func (pm *ProcessManager) isProcessDead(pid int) bool {
+	process, err := os.FindProcess(pid)
+	if err != nil {
+		return true // Process doesn't exist in OS
+	}
+
+	// Signal(0) doesn't kill the process, just checks if it exists
+	err = process.Signal(syscall.Signal(0))
+	return err != nil // Signal(0) fails if process doesn't exist
+}
+
 // stopProcessInternal stops a process gracefully with SIGTERM, then SIGKILL if needed
 func (pm *ProcessManager) stopProcessInternal(process *Process) error {
 	if process.Cmd == nil || process.Cmd.Process == nil {
@@ -164,20 +225,87 @@ func (pm *ProcessManager) stopProcessInternal(process *Process) error {
 		process.cancel()
 	}
 
+	// Try process group termination first (more effective for stubborn processes)
+	pgid, err := pm.getProcessGroupID(pid)
+	if err != nil {
+		pm.logger.Warn("Failed to get process group ID, using individual PID", "pid", pid, "error", err)
+	} else {
+		pm.logger.Info("Attempting process group termination", "pid", pid, "pgid", pgid)
+
+		// Try graceful shutdown for entire process group
+		if err := syscall.Kill(-pgid, syscall.SIGTERM); err != nil {
+			pm.logger.Warn("Failed to send SIGTERM to process group", "pid", pid, "pgid", pgid, "error", err)
+		} else {
+			// Give process group time to terminate gracefully
+			time.Sleep(3 * time.Second)
+
+			// Check if process group is dead
+			if pm.isProcessDead(pid) {
+				pm.logger.Info("Process group terminated gracefully", "pid", pid, "pgid", pgid)
+				return nil
+			}
+		}
+	}
+
+	// Fallback to individual process termination if process group didn't work
+	pm.logger.Info("Process group termination failed or incomplete, trying individual PID", "pid", pid)
+
+	// Check if process is already dead before attempting signals
+	if pm.isProcessDead(pid) {
+		pm.logger.Info("Process already dead, no need for further termination", "pid", pid)
+		return nil
+	}
+
 	// Try graceful shutdown with SIGTERM
 	if err := process.Cmd.Process.Signal(syscall.SIGTERM); err != nil {
 		pm.logger.Warn("Failed to send SIGTERM", "pid", pid, "error", err)
+	} else {
+		// Wait for graceful shutdown with reasonable timeout
+		done := make(chan error, 1)
+		go func() {
+			done <- process.Cmd.Wait()
+		}()
+
+		select {
+		case err := <-done:
+			// Process exited gracefully
+			pm.logger.Info("Process terminated gracefully", "pid", pid, "error", err)
+			// Don't treat "signal: terminated" as an error - it's expected behavior
+			if err != nil && !isExpectedTerminationError(err) {
+				return err
+			}
+			return nil
+		case <-time.After(5 * time.Second):
+			// Timeout, proceed to force kill
+			pm.logger.Warn("Process didn't terminate gracefully within 5s, forcing", "pid", pid)
+		}
 	}
 
-	// Give process time to exit, then force kill if needed
-	time.Sleep(100 * time.Millisecond)
+	// Force kill if graceful shutdown failed or timed out
+	// Check if process is already dead before attempting kill
+	if pm.isProcessDead(pid) {
+		pm.logger.Info("Process already dead during graceful shutdown", "pid", pid)
+		return nil
+	}
 
-	// Force kill to ensure process stops
 	if err := process.Cmd.Process.Kill(); err != nil {
-		pm.logger.Warn("Failed to kill process", "pid", pid, "error", err)
+		pm.logger.Error("Failed to kill process", "pid", pid, "error", err)
+		return err
 	}
 
-	// Don't wait to avoid race condition with monitoring goroutine
+	// Wait for the process to actually die and verify it's gone
+	if err := process.Cmd.Wait(); err != nil {
+		pm.logger.Info("Process force-killed", "pid", pid, "error", err)
+	} else {
+		pm.logger.Info("Process force-killed cleanly", "pid", pid)
+	}
+
+	// Additional verification that the process is actually dead
+	if !pm.isProcessDead(pid) {
+		pm.logger.Error("Process still running after kill attempt", "pid", pid)
+		return fmt.Errorf("process %d still running after termination", pid)
+	}
+
 	return nil
 }
 
